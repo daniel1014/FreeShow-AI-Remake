@@ -1,0 +1,765 @@
+import { get } from "svelte/store"
+import { uid } from "uid"
+import type { Item, Layout, Line, Slide, SlideData } from "../../types/Show"
+import { DEFAULT_ITEM_STYLE } from "../components/edit/scripts/itemHelpers"
+import { getExtension, getFileName, getMediaType } from "../components/helpers/media"
+import { checkName, getGlobalGroup, initializeMetadata, newSlide } from "../components/helpers/show"
+import { translateText } from "../utils/language"
+import { ShowObj } from "./../classes/Show"
+import { activePopup, alertMessage, groups, shows } from "./../stores"
+import { createCategory, setTempShows } from "./importHelpers"
+import { xml2json } from "./xml"
+
+export function convertProPresenter(data: any) {
+    alertMessage.set("popup.importing")
+    activePopup.set("alert")
+
+    const categoryId = createCategory("ProPresenter")
+
+    // JSON Bundle
+    const newData: any[] = []
+    data?.forEach(({ content, name, extension }: any) => {
+        if (extension !== "json") return
+
+        let song: any = {}
+        try {
+            song = JSON.parse(content)
+        } catch (err) {
+            console.error(err)
+        }
+
+        if (Array.isArray(song.data)) {
+            song.data.forEach((songData) => {
+                newData.push({ content: songData, name, extension: "jsonbundle" })
+            })
+        }
+    })
+    if (newData.length) data = newData
+
+    const tempShows: any[] = []
+
+    setTimeout(() => {
+        data?.forEach(({ content, name, extension }: any) => {
+            let song: any = {}
+
+            if (!content) {
+                console.error("File missing content!")
+                return
+            }
+
+            if (extension === "json" || extension === "pro") {
+                try {
+                    song = JSON.parse(content)
+                } catch (err) {
+                    console.error(err)
+                }
+            } else if (extension === "jsonbundle") {
+                song = content
+            } else {
+                song = xml2json(content)?.RVPresentationDocument
+            }
+
+            if (!song) return
+
+            const layoutID = uid()
+            const show = new ShowObj(false, categoryId, layoutID)
+            let showId = song["@uuid"] || song.uuid?.string || song._id || uid()
+            show.origin = "propresenter"
+            show.name = checkName(song.name === "Untitled" ? name : song.name || song.title || name, showId)
+
+            // propresenter often uses the same id for duplicated songs
+            const existingShow = get(shows)[showId] || tempShows.find((a) => a.id === showId)?.show
+            if (existingShow && existingShow.name !== (song.name || name)) showId = uid()
+
+            let converted: any = {}
+
+            if (extension === "pro") {
+                converted = convertProToSlides(song)
+            } else if (extension === "json") {
+                converted = convertJSONToSlides(song)
+            } else if (extension === "jsonbundle") {
+                converted = convertJSONBundleToSlides(song)
+            } else {
+                converted = convertToSlides(song, extension)
+            }
+
+            const { slides, layouts, media }: any = converted
+            if (!Object.keys(slides).length) return
+
+            show.slides = slides
+            show.layouts = {}
+            show.media = media
+
+            show.meta = initializeMetadata({
+                title: song["@CCLISongTitle"] || song.ccli?.songTitle,
+                artist: song["@CCLIArtistCredits"],
+                author: song["@CCLIAuthor"] || song.ccli?.author || song.author,
+                publisher: song["@CCLIPublisher"] || song.ccli?.publisher,
+                copyright: song.copyrights_info,
+                CCLI: song["@CCLISongNumber"] || song.ccli?.songNumber,
+                year: song["@CCLICopyrightYear"] || song.ccli?.copyrightYear
+            })
+
+            layouts.forEach((layout: any, i: number) => {
+                show.layouts[i === 0 ? layoutID : layout.id] = {
+                    name: layout.name || translateText("example.default"),
+                    notes: i === 0 ? song["@notes"] || "" : "",
+                    slides: layout.slides
+                }
+            })
+
+            tempShows.push({ id: showId, show })
+        })
+
+        setTempShows(tempShows)
+    }, 50)
+}
+
+function convertJSONBundleToSlides(song: any) {
+    const slides: any = {}
+    const layoutSlides: any = []
+
+    const parentId = uid()
+    const children: string[] = []
+
+    song.lyrics.forEach(({ lyrics }) => {
+        if (!lyrics) return
+
+        const parent = !Object.keys(slides).length
+        const id: string = parent ? parentId : uid()
+
+        if (parent) layoutSlides.push({ id })
+
+        lyrics = lyrics.replaceAll("<p>", "").replaceAll("</p>", "")
+        const items = [
+            {
+                style: DEFAULT_ITEM_STYLE,
+                lines: lyrics.split("<br>").map((a: any) => ({ align: "", text: [{ style: "", value: a }] }))
+            }
+        ]
+
+        slides[id] = newSlide({ items })
+
+        if (parent) {
+            slides[id].group = ""
+            if (get(groups).verse) slides[id].globalGroup = "verse"
+        } else {
+            children.push(id)
+        }
+    })
+
+    slides[parentId].children = children
+
+    const layouts = [{ id: uid(), name: "", notes: "", slides: layoutSlides }]
+    return { slides, layouts }
+}
+
+const JSONgroups: any = { V: "verse", C: "chorus", B: "bridge", T: "tag", O: "outro" }
+function convertJSONToSlides(song: any) {
+    const slides: any = {}
+    let layoutSlides: any = []
+
+    const initialSlidesList: string[] = song.verse_order_list || []
+    let slidesList: string[] = []
+    const slidesRef: any = {}
+
+    song.verses.forEach(([text, label]) => {
+        if (!text) return
+
+        const id: string = uid()
+        slidesList.push(label)
+        slidesRef[label] = id
+
+        layoutSlides.push({ id })
+
+        const items = [
+            {
+                style: DEFAULT_ITEM_STYLE,
+                lines: text.split("\n").map((a: any) => ({ align: "", text: [{ style: "", value: a }] }))
+            }
+        ]
+
+        slides[id] = newSlide({ items })
+
+        const globalGroup = label ? JSONgroups[label.replace(/[0-9]/g, "").toUpperCase()] : "verse"
+        if (get(groups)[globalGroup]) slides[id].globalGroup = globalGroup
+    })
+
+    if (initialSlidesList.length) slidesList = initialSlidesList
+    if (slidesList.length) {
+        layoutSlides = []
+        slidesList.forEach((label) => {
+            if (slidesRef[label]) layoutSlides.push({ id: slidesRef[label] })
+        })
+    }
+
+    const layouts = [{ id: uid(), name: "", notes: "", slides: layoutSlides }]
+    return { slides, layouts }
+}
+
+function convertToSlides(song: any, extension: string) {
+    let slideGroups: any = []
+    if (extension === "pro4") slideGroups = song.slides.RVDisplaySlide || []
+    if (extension === "pro5") slideGroups = song.groups.RVSlideGrouping || []
+    if (extension === "pro6") slideGroups = song.array[0].RVSlideGrouping || []
+    if (!Array.isArray(slideGroups)) slideGroups = [slideGroups]
+    const arrangements = song.arrangements || song.array?.[1]?.RVSongArrangement || []
+
+    // console.log(song)
+
+    const slides: any = {}
+    const layouts: any[] = [{ id: null, name: "", slides: [] }]
+    const media: any = {}
+    const sequences: any = {}
+
+    const backgrounds: any = []
+
+    slideGroups.forEach((group) => {
+        let groupSlides = group
+        if (extension === "pro4") groupSlides = [groupSlides]
+        if (extension === "pro5") groupSlides = groupSlides.slides.RVDisplaySlide
+        if (extension === "pro6" && groupSlides.array) groupSlides = groupSlides.array.RVDisplaySlide
+        if (!Array.isArray(groupSlides)) groupSlides = [groupSlides]
+        if (!groupSlides?.length) return
+
+        let slideIndex = -1
+        groupSlides.forEach((slide) => {
+            const items = getSlideItems(slide)
+            // console.log(slide, items)
+            if (!items?.length) return
+            slideIndex++
+
+            const slideIsDisabled = slide["@enabled"] === "false"
+            const slideId: string = uid()
+
+            slides[slideId] = newSlide({ notes: slide["@notes"] || "", items })
+
+            // media
+            const mediaCue = slide.RVMediaCue
+
+            // TODO: images
+            const path: string = mediaCue?.RVVideoElement?.["@source"] || ""
+            if (path) backgrounds[slideIndex] = { path, name: mediaCue["@displayName"] || "" }
+
+            const isFirstSlide: boolean = slideIndex === 0
+            if (isFirstSlide) {
+                slides[slideId] = makeParentSlide(slides[slideId], {
+                    label: group["@name"] || slides[slideId]["@label"] || "",
+                    color: group["@color"] || slides[slideId]["@highlightColor"]
+                })
+
+                const groupId = group["@uuid"]
+                sequences[groupId] = slideId
+
+                const l: any = { id: slideId }
+                if (slideIsDisabled) l.disabled = true
+                layouts[0].slides.push(l)
+            } else {
+                // children
+                const parentLayout = layouts[0].slides[layouts[0].slides.length - 1]
+                const parentSlide = slides[parentLayout.id]
+                if (!parentSlide.children) parentSlide.children = []
+                parentSlide.children.push(slideId)
+
+                if (slideIsDisabled) {
+                    if (!parentLayout.children) parentLayout.children = {}
+                    parentLayout.children[slideId] = { disabled: true }
+                }
+            }
+        })
+    })
+
+    if (arrangements.length) {
+        const newLayouts = arrangeLayouts(arrangements, sequences)
+        // if (newLayouts.length) layouts = newLayouts
+        if (newLayouts.length) layouts.push(...newLayouts)
+    }
+
+    backgrounds.forEach((background: any, i: number) => {
+        if (!background || !layouts[i]) return
+        if (!layouts[0].slides[i]) return
+
+        const id = uid()
+        layouts[0].slides[i].background = id
+        media[id] = background
+    })
+
+    return { slides, layouts, media }
+}
+
+function getSlideItems(slide: any) {
+    if (!slide) return []
+
+    let elements: any = null
+    if (slide.displayElements) elements = slide.displayElements
+    else elements = slide.array.find((a) => a["@rvXMLIvarName"] === "displayElements")
+    if (!elements) return []
+
+    if (!elements.RVTextElement) {
+        return []
+    }
+
+    const items: Item[] = []
+
+    const textElement = elements.RVTextElement
+    let itemStrings = elements.RVTextElement.NSString
+    if (!itemStrings && Array.isArray(textElement)) itemStrings = textElement.map((a) => a.NSString)
+    if (!itemStrings) itemStrings = [elements.RVTextElement["@RTFData"]]
+    else if (itemStrings["#text"]) itemStrings = [itemStrings]
+
+    const rtf = itemStrings.find((a) => a["@rvXMLIvarName"] === "RTFData")
+    const plain = itemStrings.find((a) => a["@rvXMLIvarName"] === "PlainText")
+    // rtf includes line breaks
+    if (rtf) itemStrings = [rtf]
+    else if (plain) itemStrings = [plain]
+
+    itemStrings.forEach((content: any) => {
+        if (!content) return
+        if (Array.isArray(content)) content = content[0]
+
+        let text = decodeBase64(content["#text"] || content)
+        // console.log(text)
+
+        const type = content["@rvXMLIvarName"]
+        if (type && type !== "RTFData" && type !== "PlainText") return
+        // text = convertFromRTFToPlain(text)
+        text = decodeHex(text)
+        // console.log(text)
+
+        if (text === "Double-click to edit") text = ""
+        items.push({ style: DEFAULT_ITEM_STYLE, lines: splitTextToLines(text) })
+    })
+
+    return items
+}
+
+function makeParentSlide(slide, { label, color = "" }) {
+    slide.group = label
+    if (color) slide.color = rgbStringToHex(color)
+    if (color === "#000000") slide.color = "#ffffff"
+
+    // set global group
+    if (label.toLowerCase() === "group") label = "verse"
+    const globalGroup = getGlobalGroup(label)
+    // if (globalGroup && !label)
+    slide.globalGroup = globalGroup || "verse"
+
+    return slide
+}
+
+function arrangeLayouts(arrangements, sequences) {
+    const layouts: Layout[] = []
+    arrangements.forEach((arrangement) => {
+        let groupIds = arrangement.array?.NSString || []
+        if (!Array.isArray(groupIds)) groupIds = [groupIds]
+        if (!groupIds.length) return
+
+        const slides: any[] = groupIds.map((groupID) => ({ id: sequences[groupID] }))
+        layouts.push({ id: arrangement["@uuid"], name: arrangement["@name"], notes: "", slides })
+    })
+
+    return layouts
+}
+
+/// //
+
+function splitTextToLines(text: string) {
+    let lines: Line[] = []
+    const data = text.replaceAll("\n\n", "<br>").split("<br>")
+    lines = data.map((lineText: string) => ({ align: "", text: [{ style: "", value: lineText.trim() }] }))
+
+    return lines
+}
+
+const latin1 = {
+    "92": "'",
+    "93": "‘", // “
+    "94": "’", // ”
+    "96": "–",
+    e6: "æ",
+    f8: "ø",
+    e5: "å",
+    c6: "Æ",
+    d8: "Ø",
+    c5: "Å",
+    f6: "ö",
+    e4: "ä",
+    d6: "Ö",
+    c4: "Ä",
+    "89": "ä", // ‰
+    "88": "ö", // ∘
+    c2: "å", // Â
+    a5: "ra", // ¥
+    e1: "á",
+    "9a": "š",
+    fd: "ý",
+    e9: "é",
+    fa: "ú",
+    ed: "í",
+    f3: "ó",
+    f4: "ô",
+    "9e": "ž",
+    c1: "Á",
+    c9: "É",
+    cd: "Í",
+    d3: "Ó",
+    da: "Ú",
+    fc: "ü",
+    dc: "Ü",
+    f1: "ñ",
+    d1: "Ñ",
+    a1: "¡",
+    bf: "¿"
+}
+
+function decodeBase64(text: string) {
+    if (typeof text !== "string") return ""
+
+    let b = 0
+    let l = 0
+    let r = ""
+    const m = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+    text.split("").forEach(function (v) {
+        b = (b << 6) + m.indexOf(v)
+        l += 6
+        if (l >= 8) r += String.fromCharCode((b >>> (l -= 8)) & 0xff)
+    })
+
+    // WIP better RTF decoding
+    // https://github.com/ChurchApps/FreeShow/issues/1200
+
+    // https://www.oreilly.com/library/view/rtf-pocket-guide/9781449302047/ch04.html
+    r = r.replaceAll("\\u8217 ?", "'")
+
+    // convert ‘ & ’ to '
+    r = r.replaceAll("‘", "'").replaceAll("’", "'")
+
+    // decode Latin-1
+    for (const [key, value] of Object.entries(latin1)) {
+        r = r.replaceAll(`\\'${key}`, value)
+    }
+
+    // decode encoded unicode dec letters
+    // https://unicodelookup.com/
+    let decCode = r.indexOf("\\u")
+    while (decCode > -1) {
+        const endOfCode = r.indexOf(" ?", decCode) + 2
+
+        if (endOfCode > 1 && endOfCode - decCode <= 10) {
+            const decodedLetter = String.fromCharCode(Number(r.slice(decCode, endOfCode).replace(/[^\d-]/g, "")))
+            if (!decodedLetter.includes("\\x")) r = r.slice(0, decCode) + decodedLetter + r.slice(endOfCode)
+        }
+
+        decCode = r.indexOf("\\u", decCode + 1)
+    }
+
+    return r
+}
+
+function RTFToText(input: string) {
+    // Handle the binary ending characters that sometimes appear
+    const binaryEndPos = input.search(/[ÿ¿\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\xFF]+$/)
+    if (binaryEndPos > -1) {
+        input = input.slice(0, binaryEndPos)
+    }
+
+    // Remove the last } if it exists
+    input = input.slice(0, input.lastIndexOf("}") > 0 ? input.lastIndexOf("}") : input.length)
+
+    // Convert common RTF commands to line breaks
+    input = input.replaceAll("\\pard", "\\remove")
+    input = input.replaceAll("\\part", "\\remove")
+    input = input.replaceAll("\\par", "__BREAK__")
+    input = input.replaceAll("\\\n", "__BREAK__")
+    input = input.replaceAll("\n", "__BREAK__")
+    input = input.replaceAll("\\u8232", "__BREAK__")
+
+    // https://stackoverflow.com/a/188877
+    const regex = /\{\*?\\[^{}]+}|[{}]|\\\n?[A-Za-z]+\n?(?:-?\d+)?[ ]?/gm
+    let newInput = input.replace(regex, "").replaceAll("\\*", "")
+
+    // some files have {} wrapped around the text, so it gets removed
+    if (!newInput.replaceAll("__BREAK__", "").trim().length) {
+        input = input.replaceAll("}", "").replaceAll("{", "")
+        newInput = input.replace(regex, "").replaceAll("\\*", "")
+
+        const formatting = newInput.lastIndexOf(";;;;")
+        if (formatting >= 0) newInput = newInput.slice(formatting + 4)
+
+        newInput = newInput.replaceAll(";;", "")
+    }
+
+    // Clean up remaining formatting artifacts
+    newInput = newInput.replace(/\s+/g, " ").trim()
+
+    const splitted = newInput.split("__BREAK__").filter((a) => a.trim())
+    return splitted.join("\n").trim()
+}
+
+function decodeHex(input: string) {
+    // If input looks like RTF but doesn't contain hex encodings, use RTF parser
+    if (input.includes("\\rtf") && !input.includes("\\'")) {
+        return RTFToText(input)
+    }
+
+    const textStart = input.indexOf("\\ltrch")
+    // remove RTF before text
+    if (textStart > -1) {
+        input = input.slice(input.indexOf(" ", textStart), input.length)
+    } else {
+        // remove main RTF styles
+        let paragraphs: string[] = input.split("\n\n")
+        if (paragraphs[0].includes("rtf")) {
+            paragraphs = paragraphs.slice(1, paragraphs.length)
+            input = paragraphs.join("\n\n")
+            input = input.slice(0, input.length - 1)
+        }
+    }
+
+    input = input.replaceAll("\\\n", "<br>")
+    const hex = input.split("\\'")
+    let str = ""
+    hex.map((txt, i) => {
+        const styles: any[] = []
+
+        // fix skipping first word sometimes
+        txt = txt.replaceAll("\r\n", "")
+        const breakPos = txt.indexOf("\n")
+        const lineFormattingPos = txt.indexOf("\\f0")
+        if (breakPos >= 0 && lineFormattingPos >= 0 && lineFormattingPos < breakPos) txt = txt.slice(breakPos, txt.length)
+
+        let styleIndex = txt.indexOf("\\")
+        while (styleIndex >= 0) {
+            let nextSpace = txt.indexOf(" ", styleIndex)
+            if (nextSpace < 1) nextSpace = txt.length
+            styles.push(txt.slice(styleIndex, nextSpace).trim())
+            txt = txt.slice(0, styleIndex) + txt.slice(nextSpace, txt.length)
+            styleIndex = txt.indexOf("\\")
+        }
+
+        if (i === 0) str = txt
+        else {
+            str += String.fromCharCode(parseInt(txt.slice(0, 2), 16))
+            str += txt.slice(2, txt.length)
+        }
+    })
+
+    // fix line formatting
+    str = str.replaceAll("}{", "<br>").replaceAll("} {", "<br>").replaceAll("}  {", "<br>").replaceAll("{ }", "")
+    // remove any {{ at the start
+    if (str.indexOf("{{") > -1 && str.indexOf("{{") < 3) str = str.slice(str.indexOf("{{") + 2, str.length)
+    // remove whitespace at start and end
+    str = str.trim()
+    // remove any } and special chars at the end
+    if (str.length - str.lastIndexOf("}") < 3) str = str.slice(0, str.lastIndexOf("}"))
+    // remove whitespace at start and end
+    str = str.trim()
+    // remove breaks at start
+    while (str.indexOf("<br>") === 0) str = str.slice(4, str.length)
+    return str
+}
+
+function rgbStringToHex(rgbaString: string) {
+    const [r, g, b, a]: any = rgbaString.split(" ")
+    // TODO: alpha
+    if (isNaN(r) || isNaN(g) || isNaN(b)) console.warn(r, g, b, a)
+
+    return `#${toHex(r * 255)}${toHex(g * 255)}${toHex(b * 255)}`
+}
+const toHex = (c: number) => ("0" + Number(c.toFixed()).toString(16)).slice(-2)
+
+/// // PRO 7 /////
+
+function convertProToSlides(song: any) {
+    const slides: any = {}
+    const media: any = {}
+    const layouts: any = []
+
+    // console.log(song)
+
+    const tempLayouts: any = {}
+    const tempArrangements: any[] = getArrangements(song.arrangements || [])
+    const tempGroups: any[] = getGroups(song.cueGroups || [])
+    const tempSlides: any[] = getSlides(song.cues || [])
+    // console.log(tempArrangements, tempGroups, tempSlides)
+
+    if (!tempArrangements.length) {
+        tempArrangements.push({ groups: Object.keys(tempGroups), name: "" })
+    }
+
+    const slidesWithoutGroup = Object.keys(tempSlides).filter((id) => !Object.values(tempGroups).find((a) => a.slides.includes(id)))
+    if (slidesWithoutGroup.length) slidesWithoutGroup.forEach((id) => createSlide(id))
+
+    tempArrangements.forEach(createLayout)
+    function createLayout({ name = "", groups: arrGroups }: any) {
+        layouts.push({ id: uid(), name, notes: "", slides: createSlides(arrGroups) })
+    }
+
+    function createSlides(arrGroups: string[]) {
+        const layoutSlides: any[] = []
+
+        arrGroups.forEach((groupId) => {
+            const group = tempGroups[groupId]
+            if (!group) return
+
+            const allSlides = group.slides.map((id, i) => createSlide(id, i === 0, { color: group.color, name: group.name }))
+            if (allSlides.length > 1) {
+                const children = allSlides.slice(1).map(({ id }) => id)
+                slides[allSlides[0].id].children = children
+            }
+
+            layoutSlides.push(allSlides[0])
+        })
+
+        return layoutSlides
+    }
+
+    function createSlide(id: string, isParent = true, { color, name }: any = {}) {
+        if (tempLayouts[id]) return tempLayouts[id]
+
+        const slideId = uid()
+        const layoutSlide: SlideData = { id: slideId }
+
+        const tempSlide = tempSlides[id]
+
+        if (tempSlide.disabled) layoutSlide.disabled = true
+
+        if (tempSlide.media) {
+            const mediaId = uid()
+            const path = tempSlide.media
+            media[mediaId] = { name: getFileName(path), path, type: getMediaType(getExtension(path)) }
+            layoutSlide.background = mediaId
+        }
+
+        const slide: Slide = {
+            group: null,
+            color: null,
+            settings: {
+                background: tempSlide.backgroundColor,
+                resolution: tempSlide.size
+            },
+            notes: "",
+            items: tempSlide.items.map(convertItem)
+        }
+
+        if (isParent) {
+            const group = name || tempSlide.name || ""
+            const globalGroup = getGlobalGroup(group)
+            slide.color = color || ""
+            slide.group = group || ""
+            if (globalGroup) slide.globalGroup = globalGroup
+        }
+
+        slides[slideId] = slide
+        tempLayouts[id] = layoutSlide
+        return layoutSlide
+    }
+
+    return { slides, layouts, media }
+}
+
+function convertItem(item: any) {
+    const text = item.text
+    let style = DEFAULT_ITEM_STYLE
+    if (item.bounds) {
+        const pos = item.bounds.origin
+        const size = item.bounds.size
+        if (Object.keys(pos).length === 2 && Object.keys(size).length === 2) {
+            style = `left:${pos.x}px;top:${pos.y}px;width:${size.width}px;height:${size.height}px;`
+        }
+    }
+
+    const newItem: Item = {
+        style,
+        lines: text.split("\n").map(getLine)
+    }
+
+    return newItem
+
+    function getLine(lineText: string) {
+        return { align: "", text: [{ value: lineText, style: "" }] }
+    }
+}
+
+function getArrangements(arrangements: any) {
+    if (!arrangements) return []
+
+    const newArrangements: any = []
+    arrangements.forEach((arr) => {
+        newArrangements.push({
+            name: arr.name,
+            groups: arr.groupIdentifiers?.map((a) => a.string) || []
+        })
+    })
+
+    return newArrangements.filter((a) => a.groups.length)
+}
+
+function getGroups(cueGroups) {
+    if (!cueGroups) return {}
+
+    const newGroups: any = {}
+    cueGroups.forEach(({ group, cueIdentifiers }) => {
+        newGroups[group.uuid.string] = {
+            name: group.name,
+            color: getColorValue(group.color),
+            slides: cueIdentifiers?.map((a) => a.string) || []
+        }
+    })
+
+    return newGroups
+}
+
+function getSlides(cues: any) {
+    const slides: any = {}
+
+    cues.forEach((slide) => {
+        const baseSlide = slide.actions.find((a) => a.slide?.presentation)?.slide?.presentation?.baseSlide || {}
+        if (!baseSlide) return
+
+        slides[slide.uuid.string] = {
+            name: slide.name,
+            disabled: !slide.isEnabled,
+            media: slide.actions.find((a) => a.media?.element)?.media?.element?.url?.absoluteString,
+            backgroundColor: getColorValue(baseSlide.backgroundColor),
+            size: baseSlide.size,
+            items: baseSlide.elements?.map(getItem) || []
+            // .filter((a) => a.text || a.bounds?.size?.width)
+        }
+    })
+
+    return slides
+}
+
+function getItem(item: any) {
+    const newItem: any = {}
+
+    newItem.bounds = item.element.bounds
+    newItem.text = decodeRTF(item.element.text?.rtfData)
+
+    return newItem
+}
+
+function decodeRTF(text: string) {
+    if (!text) return ""
+
+    text = decodeBase64(text)
+    // console.log(text)
+    text = RTFToText(text)
+    // console.log(text)
+    return text
+}
+
+function getColorValue(color: { red: number; green: number; blue: number; alpha: number }) {
+    if (!color) return ""
+
+    color = {
+        red: color.red || 255,
+        green: color.green || 255,
+        blue: color.blue || 255,
+        alpha: color.alpha || 1
+    }
+
+    return "rgb(" + [color.red.toFixed(2), color.green.toFixed(2), color.blue.toFixed(2)].join(" ") + " / " + color.alpha.toFixed(1) + ")"
+}
